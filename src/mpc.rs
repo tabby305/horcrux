@@ -249,12 +249,99 @@ pub fn shard_ids(paths: &[PathBuf]) -> Result<Vec<u8>, Error> {
     paths.iter().map(|p| Ok(FrostShare::read(p)?.id)).collect()
 }
 
+/// Deserialize a group public key package, mapping errors to [`Error::Mpc`].
+/// Used by both the in-process ([`mpc_sign`]) and air-gapped ([`crate::qr_mpc`])
+/// paths, which must accept the same on-disk format.
+pub fn deserialize_public_key_package(
+    bytes: &[u8],
+) -> Result<frost::keys::PublicKeyPackage, Error> {
+    frost::keys::PublicKeyPackage::deserialize(bytes)
+        .map_err(|e| Error::Mpc(format!("invalid group public package: {e}")))
+}
+
 /// Read the group verifying key (the Mode A address bytes) from a public key
 /// package without touching any share files.
 pub fn group_verifying_key(group_pub_path: &Path) -> Result<[u8; 32], Error> {
     let bytes = fs::read(group_pub_path).map_err(Error::Io)?;
-    let group_pub = frost::keys::PublicKeyPackage::deserialize(&bytes)
-        .map_err(|e| Error::Mpc(format!("invalid group public package: {e}")))?;
+    let group_pub = deserialize_public_key_package(&bytes)?;
+    verifying_key_bytes(&group_pub)
+}
+
+/// FROST round 1: generate a nonce pair and its commitment for a participant,
+/// in-process. Returns the participant's identifier, nonces (kept secret until
+/// round 2) and commitment (sent to the coordinator).
+pub fn participant_round1(
+    key_package: &frost::keys::KeyPackage,
+    rng: &mut (impl rand::RngCore + rand::CryptoRng),
+) -> (
+    frost::Identifier,
+    frost::round1::SigningNonces,
+    frost::round1::SigningCommitments,
+) {
+    let (nonces, commitment) = frost::round1::commit(key_package.signing_share(), rng);
+    (*key_package.identifier(), nonces, commitment)
+}
+
+/// Build the coordinator's signing package from the collected commitments and
+/// the message to sign. The message is the same byte string every participant
+/// later signs and the coordinator verifies.
+pub fn build_signing_package(
+    commitments: BTreeMap<frost::Identifier, frost::round1::SigningCommitments>,
+    message: &[u8],
+) -> frost::SigningPackage {
+    frost::SigningPackage::new(commitments, message)
+}
+
+/// FROST round 2: produce one participant's signature share for the signing
+/// package. Fails if the package lacks this participant's commitment or if the
+/// nonces do not match it (frost-core enforces both).
+pub fn participant_round2(
+    signing_package: &frost::SigningPackage,
+    nonces: &frost::round1::SigningNonces,
+    key_package: &frost::keys::KeyPackage,
+) -> Result<frost::round2::SignatureShare, Error> {
+    frost::round2::sign(signing_package, nonces, key_package)
+        .map_err(|e| Error::Mpc(format!("failed to produce signature share: {e}")))
+}
+
+/// Aggregate signature shares into a single Ed25519 signature and verify it
+/// against the group verifying key before returning. A signature that fails
+/// verification is never returned.
+pub fn aggregate_signature(
+    signing_package: &frost::SigningPackage,
+    signature_shares: &BTreeMap<frost::Identifier, frost::round2::SignatureShare>,
+    group_pub: &frost::keys::PublicKeyPackage,
+) -> Result<MpcSignature, Error> {
+    let signature = frost::aggregate(signing_package, signature_shares, group_pub)
+        .map_err(|e| Error::Mpc(format!("failed to aggregate signature: {e}")))?;
+
+    if group_pub
+        .verifying_key()
+        .verify(signing_package.message(), &signature)
+        .is_err()
+    {
+        return Err(Error::Mpc(
+            "aggregated signature failed FROST verification".to_string(),
+        ));
+    }
+
+    Ok(MpcSignature {
+        signature: signature_bytes(&signature)?,
+        verifying_key: verifying_key_bytes(group_pub)?,
+    })
+}
+
+/// Serialize a FROST signature to its 64-byte Ed25519 form.
+fn signature_bytes(signature: &frost::Signature) -> Result<[u8; 64], Error> {
+    signature
+        .serialize()
+        .map_err(|e| Error::Mpc(e.to_string()))?
+        .try_into()
+        .map_err(|_| Error::Mpc("signature is not 64 bytes".to_string()))
+}
+
+/// Serialize a group verifying key to its 32-byte form.
+fn verifying_key_bytes(group_pub: &frost::keys::PublicKeyPackage) -> Result<[u8; 32], Error> {
     group_pub
         .verifying_key()
         .serialize()
@@ -285,8 +372,7 @@ pub fn mpc_sign(
     }
 
     let group_bytes = fs::read(group_pub_path).map_err(Error::Io)?;
-    let group_pub = frost::keys::PublicKeyPackage::deserialize(&group_bytes)
-        .map_err(|e| Error::Mpc(format!("invalid group public package: {e}")))?;
+    let group_pub = deserialize_public_key_package(&group_bytes)?;
     let group_vk = *group_pub.verifying_key();
 
     let mut rng = rand::rngs::OsRng;
@@ -310,8 +396,8 @@ pub fn mpc_sign(
             return Err(Error::MpcGroupMismatch { path: path.clone() });
         }
 
-        let (nonces, commitment) = frost::round1::commit(key_package.signing_share(), &mut rng);
-        commitments.insert(*key_package.identifier(), commitment);
+        let (identifier, nonces, commitment) = participant_round1(&key_package, &mut rng);
+        commitments.insert(identifier, commitment);
         participants.push((key_package, nonces));
     }
 
@@ -320,43 +406,15 @@ pub fn mpc_sign(
         return Err(Error::NotEnoughShares(min, participants.len()));
     }
 
-    let signing_package = frost::SigningPackage::new(commitments, message);
+    let signing_package = build_signing_package(commitments, message);
     let mut signature_shares: BTreeMap<frost::Identifier, frost::round2::SignatureShare> =
         BTreeMap::new();
     for (key_package, nonces) in &participants {
-        let share = frost::round2::sign(&signing_package, nonces, key_package)
-            .map_err(|e| Error::Mpc(e.to_string()))?;
+        let share = participant_round2(&signing_package, nonces, key_package)?;
         signature_shares.insert(*key_package.identifier(), share);
     }
 
-    let signature = frost::aggregate(&signing_package, &signature_shares, &group_pub)
-        .map_err(|e| Error::Mpc(e.to_string()))?;
-
-    if group_pub
-        .verifying_key()
-        .verify(message, &signature)
-        .is_err()
-    {
-        return Err(Error::Mpc(
-            "aggregated signature failed FROST verification".to_string(),
-        ));
-    }
-
-    let signature_bytes: [u8; 64] = signature
-        .serialize()
-        .map_err(|e| Error::Mpc(e.to_string()))?
-        .try_into()
-        .map_err(|_| Error::Mpc("signature is not 64 bytes".to_string()))?;
-    let verifying_key: [u8; 32] = group_vk
-        .serialize()
-        .map_err(|e| Error::Mpc(e.to_string()))?
-        .try_into()
-        .map_err(|_| Error::Mpc("verifying key is not 32 bytes".to_string()))?;
-
-    Ok(MpcSignature {
-        signature: signature_bytes,
-        verifying_key,
-    })
+    aggregate_signature(&signing_package, &signature_shares, &group_pub)
 }
 
 /// Like [`mpc_sign`], recording each participant's decryption outcome and a
@@ -390,7 +448,7 @@ pub fn mpc_sign_with_audit(
 /// The participant id as a `u8`. The default FROST split assigns the nonzero
 /// identifiers `1..=n`; their little-endian scalar serialization starts with
 /// the id byte.
-fn share_id(identifier: &frost::Identifier) -> u8 {
+pub(crate) fn share_id(identifier: &frost::Identifier) -> u8 {
     identifier.serialize()[0]
 }
 

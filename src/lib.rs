@@ -13,6 +13,8 @@ pub mod cosmos;
 pub mod crypto;
 pub mod error;
 pub mod mpc;
+pub mod qr;
+pub mod qr_mpc;
 pub mod shard;
 pub mod sss;
 pub mod tx;

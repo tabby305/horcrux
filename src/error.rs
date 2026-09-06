@@ -44,6 +44,14 @@ pub enum Error {
     #[error("mpc error: {0}")]
     Mpc(String),
 
+    /// An HX3 (air-gapped QR transport) frame was malformed or corrupt.
+    #[error("hx3 frame error: {0}")]
+    Hx3(String),
+
+    /// A QR code image could not be encoded or decoded.
+    #[error("qr transport error: {0}")]
+    Qr(String),
+
     /// The underlying secret-sharing library failed.
     #[error("secret-sharing error: {0}")]
     Vsss(String),
